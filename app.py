@@ -4,13 +4,15 @@ from __future__ import annotations
 import copy
 import os
 import streamlit as st
+import streamlit.components.v1 as components
 
 from core.ai_engine import AIEngine
 from core.orchestrator import run_editorial
 from core.storage import Storage
 from services.exporter import create_docx, create_markdown
+from services.infographic import card_height, render_html, render_svg
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 
 st.set_page_config(page_title="AI Writer Studio", page_icon="✍️", layout="wide", initial_sidebar_state="expanded")
 
@@ -24,7 +26,7 @@ def secret(name: str, default: str = "") -> str:
 
 def initialize_state():
     defaults = {"authenticated": False, "article": "", "analysis": "", "strategy": "", "sources": [],
-                "fact_checks": [], "call_log": [], "last_topic": "", "history_id": None,
+                "fact_checks": [], "infographics": [], "call_log": [], "last_topic": "", "history_id": None,
                 "article_editor": "", "last_loaded_history": None}
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -68,6 +70,11 @@ with st.sidebar:
     content_format = st.selectbox("Формат для X", ["X Article", "Thread", "Single Post", "Research Post", "Market Commentary"])
     style = st.selectbox("Стиль", ["Аналитический", "Экспертный", "Журналистский", "Научно-популярный", "Технический", "Неформальный"])
     length = st.select_slider("Объём (для длинных форматов)", options=[500, 1000, 1500, 2000, 3000, 5000], value=1500)
+    make_infographics = st.checkbox(
+        "Автоматически создавать инфографику, если она полезна",
+        value=True,
+        help="Добавляет один AI-запрос. Карточки формируются только из утверждений, прошедших этап фактчекинга.",
+    )
     st.divider()
     st.subheader("AI-провайдеры")
     if engine.gemini_key:
@@ -91,7 +98,7 @@ with st.sidebar:
             if chosen_id != st.session_state.last_loaded_history:
                 record = storage.get_session(chosen_id)
                 if record:
-                    for key in ("article", "analysis", "strategy", "sources", "fact_checks", "last_topic"):
+                    for key in ("article", "analysis", "strategy", "sources", "fact_checks", "infographics", "last_topic"):
                         st.session_state[key] = record.get(key) or ("" if key in {"article", "analysis", "strategy", "last_topic"} else [])
                     st.session_state.last_topic = record["topic"]
                     st.session_state.history_id = record["id"]
@@ -124,19 +131,23 @@ if run_clicked:
         engine.logs.clear()
         progress_bar = st.progress(0)
         status_text = st.empty()
-        stages = {"search": 0.05, "extract": 0.22, "analysis": 0.42, "strategy": 0.56,
-                  "writing": 0.70, "fact_check": 0.82, "editing": 0.93, "done": 1.0}
+        stages = {"search": 0.05, "extract": 0.20, "analysis": 0.38, "strategy": 0.52,
+                  "writing": 0.66, "fact_check": 0.78, "infographic": 0.87, "editing": 0.94, "done": 1.0}
         def report(stage, message):
             status_text.info(message)
             progress_bar.progress(stages.get(stage, 0.2))
         try:
-            result = run_editorial(topic.strip(), language, style, length, content_format, engine, progress=report)
+            result = run_editorial(
+                topic.strip(), language, style, length, content_format, engine,
+                make_infographics=make_infographics, progress=report,
+            )
             result["call_log"] = engine.logs
             st.session_state.article = result["article"]
             st.session_state.analysis = result["analysis"]
             st.session_state.strategy = result["strategy"]
             st.session_state.sources = result["sources"]
             st.session_state.fact_checks = result["fact_checks"]
+            st.session_state.infographics = result.get("infographics", [])
             st.session_state.call_log = engine.logs
             st.session_state.last_topic = topic.strip()
             st.session_state.article_editor = result["article"]
@@ -153,7 +164,9 @@ if run_clicked:
 if st.session_state.article:
     st.divider()
     st.subheader("📄 Черновик")
-    tab_article, tab_analysis, tab_sources, tab_facts, tab_logs = st.tabs(["Материал", "Исследование", "Источники", "Фактчекинг", "Логи"])
+    tab_article, tab_analysis, tab_sources, tab_facts, tab_visuals, tab_logs = st.tabs(
+        ["Материал", "Исследование", "Источники", "Фактчекинг", "Инфографика", "Логи"]
+    )
     with tab_article:
         st.text_area("Редактировать перед экспортом", key="article_editor", height=520)
         if st.button("💾 Сохранить правки", type="primary"):
@@ -199,6 +212,28 @@ if st.session_state.article:
                     st.caption(f"Дата данных: {check.get('data_date', 'unknown')} · Источники: {check.get('source_ids', [])}")
         else:
             st.warning("Проверки не распознаны. Не считайте утверждения подтверждёнными автоматически.")
+    with tab_visuals:
+        if st.session_state.infographics:
+            st.caption("Карточки собираются из дословных утверждений фактчекинга и сохраняются вместе с проектом.")
+            for index, card in enumerate(st.session_state.infographics, 1):
+                st.subheader(f"Карточка {index}")
+                components.html(render_html(card), height=max(card_height(card), card_height(card, mobile=True)) + 8, scrolling=False)
+                st.download_button(
+                    "Скачать векторную карточку (SVG)",
+                    data=render_svg(card),
+                    file_name=f"infographic_{index}.svg",
+                    mime="image/svg+xml",
+                    key=f"infographic_download_{st.session_state.history_id}_{index}",
+                )
+                cited = card.get("source_ids", [])
+                if cited:
+                    st.caption("Источники карточки:")
+                    for source_id in cited:
+                        if 1 <= source_id <= len(st.session_state.sources):
+                            source = st.session_state.sources[source_id - 1]
+                            st.markdown(f"[{source_id}] {source.get('title') or source.get('url')} — {source.get('url')}")
+        else:
+            st.info("Карточка не создана: инфографика не добавила бы наглядности, генерация отключена или не хватило проверенных утверждений.")
     with tab_logs:
         if st.session_state.call_log:
             st.dataframe(st.session_state.call_log, use_container_width=True, hide_index=True)
